@@ -1,0 +1,143 @@
+# Builds the four Vast.ai pipeline images (see README.md §5.6) and pushes them to GHCR.
+#
+#   push to main    -> build all four, push :latest and :sha-<short>
+#   pull request    -> build all four, push nothing (acts as a check)
+#   Run workflow    -> manual trigger from the Actions tab
+#
+# The image owner is taken from the repository owner, so the same file pushes to
+# ghcr.io/<your-user>/... on a fork and ghcr.io/teas-project/... upstream.
+
+name: Build pipeline images
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'pipeline/**'
+      - '.github/workflows/build-images.yml'
+  pull_request:
+    paths:
+      - 'pipeline/**'
+      - '.github/workflows/build-images.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write   # lets GITHUB_TOKEN push to ghcr.io
+
+# A newer push to the same branch/PR cancels a build still in progress.
+concurrency:
+  group: build-images-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false   # one image failing shouldn't cancel the other three
+      matrix:
+        engine: [vllm, sglang]
+        family: [bench, agentic]
+        # `include` adds keys to the existing engine x family combinations rather
+        # than creating new ones, because `family` matches an axis above.
+        include:
+          - family: bench
+            dockerfile: Dockerfile
+          - family: agentic
+            dockerfile: Dockerfile.agentic
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The vLLM/SGLang base images are 10 GB+ and ubuntu-latest has ~14 GB free on /
+      # out of the box. Drop toolchains we don't need. If this still isn't enough,
+      # jlumbroso/free-disk-space reclaims more.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          df -h /
+
+      # Mirrors the $(git rev-parse --short HEAD) used in the manual build command,
+      # so metadata.json records the same thing regardless of where the image was built.
+      - name: Resolve short commit
+        id: sha
+        run: echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Works out the tag list (and lowercases the image name, which GHCR requires).
+      - name: Compute image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.engine }}-${{ matrix.family }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=short
+
+      # Layer cache is per-image (scope) and shared across runs. GitHub caps the
+      # cache at 10 GB per repo so four images will evict each other, and cache hits
+      # stop at the first unpinned `git clone` layer in the Dockerfile anyway — it
+      # mainly saves the apt layers. Still worth having.
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: pipeline
+          file: pipeline/vast/${{ matrix.engine }}/${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          build-args: TEASBENCH_COMMIT=${{ steps.sha.outputs.short }}
+          load: true   # into the local Docker daemon so the smoke test can run it
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.engine }}-${{ matrix.family }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.engine }}-${{ matrix.family }}
+
+      # Same checks the Vast.ai extra_setup block in configs/config.yaml makes at
+      # runtime before it tells you to "rebuild the agentic image". Runs whichever
+      # tag metadata-action listed first; all tags point at the same image.
+      - name: Smoke test (bench)
+        if: matrix.family == 'bench'
+        run: |
+          docker run --rm --entrypoint bash "${{ fromJSON(steps.meta.outputs.json).tags[0] }}" -c '
+            set -e
+            test -d /opt/MoE-CAP
+            test -f /opt/teasbench/pipeline/configs/config.yaml
+            test -f /opt/teasbench/pipeline/vast/resolve_commands.py
+            printenv TEASBENCH_COMMIT
+          '
+
+      - name: Smoke test (agentic)
+        if: matrix.family == 'agentic'
+        run: |
+          docker run --rm --entrypoint bash "${{ fromJSON(steps.meta.outputs.json).tags[0] }}" -c '
+            set -e
+            python3 -c "import swerex, swebench, modal"
+            test -d /opt/swe_agent
+            grep -q AGENTCAP_STREAMING_PATCH_APPLIED /opt/swe_agent/sweagent/agent/models.py
+            test -f /opt/AgentCAP/mcp-server/.venv/.mcp_packages_installed
+            printenv TEASBENCH_COMMIT
+          '
+
+      # Re-running the build with push: true is a cache hit — nothing is rebuilt,
+      # the layers are just uploaded.
+      - name: Push image
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: pipeline
+          file: pipeline/vast/${{ matrix.engine }}/${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          build-args: TEASBENCH_COMMIT=${{ steps.sha.outputs.short }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.engine }}-${{ matrix.family }}

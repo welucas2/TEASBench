@@ -572,6 +572,13 @@ commands run exactly as they do in Kubernetes/EIDF runs.
 If you wish to build your own images, you should change the tag `-t` option to reflect the container registry you wish
 to use.
 
+The images are also built automatically by the GitHub Actions workflow in `.github/workflows/build-images.yml`:
+every push to `main` that touches `pipeline/` builds all four and pushes them to GHCR tagged `:latest` and
+`:sha-<short-commit>`; pull requests build (and smoke test) the images without pushing. The image owner is taken from
+the repository owner, so the same workflow pushes to `ghcr.io/<your-user>/...` when run on a fork. Note that for the
+workflow to push to an existing package, the package's settings on GitHub must grant the repository write access
+(package → Package settings → Manage Actions access).
+
 ---
 
 ## 6. Troubleshooting
